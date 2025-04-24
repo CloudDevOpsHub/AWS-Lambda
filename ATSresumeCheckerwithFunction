@@ -1,0 +1,78 @@
+import boto3
+import json
+import time
+
+# Initialize AWS clients
+s3 = boto3.client('s3')
+textract = boto3.client('textract')
+dynamodb = boto3.resource('dynamodb')
+ses = boto3.client('ses')
+
+# DynamoDB table and email details (if needed)
+DDB_TABLE = 'ATS_Screening_Results'
+KEYWORDS = ['DevOps', 'AWS', 'Python', 'Kubernetes']
+HR_EMAIL = 'hr@example.com'  # Replace with verified SES email
+
+def lambda_handler(event, context):
+    print("Received event:", json.dumps(event))
+
+    # Step 1: Extract bucket and file info
+    record = event['Records'][0]
+    bucket_name = record['s3']['bucket']['name']
+    file_name = record['s3']['object']['key']
+    
+    print(f"Processing file: {file_name} from bucket: {bucket_name}")
+
+    # Step 2: Call Textract to extract text from PDF
+    response = textract.start_document_text_detection(
+        DocumentLocation={'S3Object': {'Bucket': bucket_name, 'Name': file_name}}
+    )
+    
+    job_id = response['JobId']
+    print("Textract job started:", job_id)
+
+    # Step 3: Wait for job to finish (simplified sync logic)
+    while True:
+        result = textract.get_document_text_detection(JobId=job_id)
+        status = result['JobStatus']
+        if status in ['SUCCEEDED', 'FAILED']:
+            break
+        time.sleep(1)
+
+    if status != 'SUCCEEDED':
+        print("Text extraction failed")
+        return {'statusCode': 500, 'body': 'Text extraction failed'}
+
+    # Step 4: Get full text from response
+    text_blocks = result['Blocks']
+    full_text = ' '.join([block['Text'] for block in text_blocks if block['BlockType'] == 'LINE'])
+
+    # Step 5: Keyword matching
+    matched_keywords = [word for word in KEYWORDS if word.lower() in full_text.lower()]
+
+    print("Matched Keywords:", matched_keywords)
+
+    # Step 6: Store results in DynamoDB
+    table = dynamodb.Table(DDB_TABLE)
+    table.put_item(Item={
+        'filename': file_name,
+        'matched_keywords': matched_keywords,
+        'full_text': full_text[:500],  # Store only a preview
+        'timestamp': int(time.time())
+    })
+
+    # Step 7: Optional - Send Email if good match
+    if matched_keywords:
+        ses.send_email(
+            Source=HR_EMAIL,
+            Destination={'ToAddresses': [HR_EMAIL]},
+            Message={
+                'Subject': {'Data': f"ATS Match: {file_name}"},
+                'Body': {'Text': {'Data': f"Keywords Matched: {matched_keywords}\n\nResume: {file_name}"}}
+            }
+        )
+
+    return {
+        'statusCode': 200,
+        'body': json.dumps({'message': 'Resume processed successfully!', 'keywords': matched_keywords})
+    }
